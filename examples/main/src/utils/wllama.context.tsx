@@ -20,6 +20,7 @@ import {
   Screen,
 } from './types';
 import { verifyCustomModel } from './custom-models';
+import { verifyLocalModel } from './local-models';
 
 interface WllamaContextValue {
   // functions for managing models
@@ -41,6 +42,9 @@ interface WllamaContextValue {
   // function for managing custom user model
   addCustomModel(url: string): Promise<void>;
   removeCustomModel(model: ManageModel): Promise<void>;
+
+  // function for managing local user model 
+  addLocalModel(files: File[]): Promise<void>;
 
   // functions for chat completion
   getWllamaInstance(): Wllama;
@@ -72,16 +76,21 @@ const getManageModels = async (): Promise<ManageModel[]> => {
     return m.size === m.metadata.originalSize;
   });
   const cachedURLs = new Set(cachedFiles.map((e) => e.metadata.originalURL));
-  const models = [...LIST_MODELS, ...WllamaStorage.load('custom_models', [])];
+  const customModels = WllamaStorage.load('custom_models', []);
+  const localModels = WllamaStorage.load('local_models', []);
+  const models = [...LIST_MODELS, ...customModels, ...localModels];
   return models.map((m) => ({
     ...m,
-    name:
-      m.url
-        .split('/')
-        .pop()
-        ?.replace(/-\d{5}-of-\d{5}/, '')
-        .replace('.gguf', '') ?? '(unknown)',
-    state: cachedURLs.has(m.url) ? ModelState.READY : ModelState.NOT_DOWNLOADED,
+    name: m.url
+      .split('/')
+      .pop()
+      ?.replace(/-\d{5}-of-\d{5}/, '')
+      .replace('.gguf', '') ?? '(unknown)',
+    state: m.userAddedLocal
+      ? ModelState.READY  // Local models are always considered ready
+      : cachedURLs.has(m.url)
+        ? ModelState.READY
+        : ModelState.NOT_DOWNLOADED,
     downloadPercent: 0,
   }));
 };
@@ -144,10 +153,25 @@ export const WllamaProvider = ({ children }: any) => {
   };
 
   const removeModel = async (model: ManageModel) => {
-    const cacheKey = await wllamaInstance.cacheManager.getNameFromURL(
-      model.url
-    );
-    await wllamaInstance.cacheManager.delete(cacheKey);
+    if (model.userAdded) {
+      const customModels = WllamaStorage.load<ManageModel[]>('custom_models', []);
+      WllamaStorage.save('custom_models', customModels.filter(m => m.url !== model.url));
+    }
+    // If model card gets stuck. This helps to remove it from the UI
+    if (model.userAddedLocal) {
+      const localModels = WllamaStorage.load<ManageModel[]>('local_models', []);
+      WllamaStorage.save('local_models', localModels.filter(m => m.url !== model.url));
+    }
+
+    if (!model.userAddedLocal) {
+      // For all models (including built-in and custom remote models), attempt to remove from cache
+      try {
+        const cacheKey = await wllamaInstance.cacheManager.getNameFromURL(model.url);
+        await wllamaInstance.cacheManager.delete(cacheKey);
+      } catch (error) {
+        console.warn(`Failed to remove model from cache: ${error}`);
+      }
+    }
     await reloadModels();
   };
 
@@ -189,8 +213,32 @@ export const WllamaProvider = ({ children }: any) => {
     if (!currModel) return;
     await wllamaInstance.exit();
     resetWllamaInstance();
-    editModel({ ...currModel, state: ModelState.READY, downloadPercent: 0 });
+    
+    if (currModel.userAddedLocal) {
+      // For local models, after unloading, remove the model from the list
+      await removeLocalModel(currModel);
+    } else {
+      // For custom and built-in models, just change the state back to READY
+      editModel({ ...currModel, state: ModelState.READY, downloadPercent: 0 });
+    }
+    
     setCurrRuntimeInfo(undefined);
+  };
+
+  const removeLocalModel = async (model: ManageModel) => {
+    setBusy(true);
+    try {
+      const localModels = WllamaStorage.load<ManageModel[]>('local_models', []);
+      WllamaStorage.save('local_models', localModels.filter(m => m.url !== model.url));
+      
+      // Remove the model card from the UI
+      setModels(prevModels => prevModels.filter(m => m.url !== model.url));
+    } catch (e) {
+      console.error('Error removing local model:', e);
+      throw e;
+    } finally {
+      setBusy(false);
+    }
   };
 
   const createCompletion = async (
@@ -265,6 +313,59 @@ export const WllamaProvider = ({ children }: any) => {
     setBusy(false);
   };
 
+  // Skip caching and directly load the model from local files
+  const loadLocalModel = async (files: File[]) => {
+    try {
+      await wllamaInstance.loadModel(files, {
+        n_threads: currParams.nThreads > 0 ? currParams.nThreads : undefined,
+        n_ctx: currParams.nContext,
+        n_batch: currParams.nBatch,
+      });
+      
+      const modelUrl = files[0].name.replace(/-\d{5}-of-\d{5}\.gguf$/, '');
+      setModels(prevModels => 
+        prevModels.map(m => 
+          m.url === modelUrl 
+            ? { ...m, state: ModelState.LOADED, downloadPercent: 1 } 
+            : m
+        )
+      );
+      
+      setCurrRuntimeInfo({
+        isMultithread: wllamaInstance.isMultithread(),
+        hasChatTemplate: !!wllamaInstance.getChatTemplate(),
+      });
+    } catch (e) {
+      resetWllamaInstance();
+      alert(`Failed to load model: ${(e as any).message ?? 'Unknown error'}`);
+    }
+  };
+
+  // Add local model then call loadLocalModel
+  const addLocalModel = async (files: File[]) => {
+    setBusy(true);
+    try {
+      const custom = await verifyLocalModel(files);
+      const currList: Model[] = WllamaStorage.load('local_models', []);
+      if (currList.some((m) => m.url === custom.url)) {
+        throw new Error('Model with the same file name already exists');
+      }
+      const newModel: Model = {
+        ...custom,
+        userAdded: false,
+        userAddedLocal: true,
+      };
+      WllamaStorage.save('local_models', [...currList, newModel]);
+      
+      await reloadModels();
+      await loadLocalModel(files);
+    } catch (e) {
+      setBusy(false);
+      throw e;
+    }
+    setBusy(false);
+  };
+
   return (
     <WllamaContext.Provider
       value={{
@@ -288,6 +389,7 @@ export const WllamaProvider = ({ children }: any) => {
         getWllamaInstance: () => wllamaInstance,
         addCustomModel,
         removeCustomModel,
+        addLocalModel,
         currRuntimeInfo,
       }}
     >
