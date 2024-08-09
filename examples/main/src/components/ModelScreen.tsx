@@ -9,11 +9,12 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import { DEFAULT_INFERENCE_PARAMS, MAX_GGUF_SIZE } from '../config';
 import { toHumanReadableSize } from '../utils/utils';
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import ScreenWrapper from './ScreenWrapper';
 
 export default function ModelScreen() {
   const [showAddCustom, setShowAddCustom] = useState(false);
+  const [showAddLocal, setShowAddLocal] = useState(false);
   const {
     models,
     removeModel,
@@ -130,6 +131,28 @@ export default function ModelScreen() {
       </div>
 
       <div className="model-management">
+        <h1 className="text-2xl mt-6 mb-4">
+          Local models
+          <button
+            className="btn btn-primary btn-outline btn-sm ml-6"
+            onClick={() => setShowAddLocal(true)}
+          >
+            + Add Local GGUF
+          </button>
+        </h1>
+
+        {models
+          .filter((m) => m.userAddedLocal)
+          .map((m) => (
+            <ModelCard key={m.url} model={m} blockModelBtn={blockModelBtn} />
+          ))}
+      </div>
+
+      {showAddLocal && (
+        <AddLocalModelDialog onClose={() => setShowAddLocal(false)} />
+      )}
+
+      <div className="model-management">
         <h1 className="text-2xl mt-6 mb-4">Recommended models</h1>
 
         {models
@@ -145,6 +168,92 @@ export default function ModelScreen() {
         <AddCustomModelDialog onClose={() => setShowAddCustom(false)} />
       )}
     </ScreenWrapper>
+  );
+}
+
+function AddLocalModelDialog({ onClose }: { onClose(): void }) {
+  const { isLoadingModel, addLocalModel } = useWllama();
+  const [selectedFiles, setSelectedFiles] = useState<FileList | null>(null);
+  const [err, setErr] = useState<string>();
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (files && files.length > 0) {
+      let totalSize = 0;
+      for (let i = 0; i < files.length; i++) {
+        totalSize += files[i].size;
+      }
+      
+      if (files[0].size > MAX_GGUF_SIZE) {
+        setErr('Model size exceeds 2GB limit.');
+        setSelectedFiles(null);
+      } else if (totalSize > 4 * 1024 * 1024 * 1024) { // 4GB in bytes
+        setErr('Total file size exceeds 4GB limit.');
+        setSelectedFiles(null);
+      } else {
+        setSelectedFiles(files);
+        setErr(undefined);
+      }
+    }
+  };
+
+  const onSubmit = async () => {
+    if (!selectedFiles) return;
+    try {
+      await addLocalModel(Array.from(selectedFiles));
+      onClose();
+    } catch (e) {
+      setErr((e as any)?.message ?? 'unknown error');
+    }
+  };
+
+  return (
+    <dialog className="modal modal-open">
+      <div className="modal-box">
+        <h3 className="font-bold text-lg">Add Local GGUF</h3>
+        <div className="mt-4">
+          Max single model is 2GB. Max split model is 4GB. Select all split files at once.
+        </div>
+        <div className="mt-4">
+          <input
+            type="file"
+            ref={fileInputRef}
+            className="hidden"
+            onChange={handleFileChange}
+            multiple
+            accept=".gguf"
+          />
+          <button
+            className="btn btn-outline btn-primary w-full"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Select GGUF File(s)
+          </button>
+          {selectedFiles && (
+            <p className="mt-2 text-sm">Selected: {Array.from(selectedFiles).map(file => file.name).join(', ')}</p>
+          )}
+        </div>
+        {err && <div className="mt-4 text-error">Error: {err}</div>}
+        <div className="modal-action">
+          <button
+            className="btn btn-primary"
+            disabled={isLoadingModel || !selectedFiles}
+            onClick={onSubmit}
+          >
+            {isLoadingModel && (
+              <span className="loading loading-spinner"></span>
+            )}
+            Load model
+          </button>
+          {!isLoadingModel && (
+            <button className="btn" onClick={onClose}>
+              Close
+            </button>
+          )}
+        </div>
+      </div>
+    </dialog>
   );
 }
 
@@ -296,7 +405,7 @@ function ModelCard({
               Download
             </button>
           )}
-          {m.state === ModelState.READY && (
+          {m.state === ModelState.READY && m.userAdded && (
             <>
               <button
                 className="btn btn-primary btn-sm mr-2"
@@ -320,12 +429,29 @@ function ModelCard({
               </button>
             </>
           )}
+          {m.state === ModelState.READY && m.userAddedLocal && (
+            <>
+              <button
+                className="btn btn-outline btn-error btn-sm mr-2"
+                onClick={() => {
+                  if (
+                    confirm('Are you sure to remove this model from cache?')
+                  ) {
+                    removeModel(m);
+                  }
+                }}
+                disabled={blockModelBtn}
+              >
+                <FontAwesomeIcon icon={faTrashAlt} />
+              </button>
+            </>
+          )}
           {m.state === ModelState.LOADED && (
             <button
               className="btn btn-outline btn-primary btn-sm mr-2"
               onClick={() => unloadModel()}
             >
-              Unload
+              {m.userAddedLocal ? 'Unload & Remove' : 'Unload'}
             </button>
           )}
           {m.state === ModelState.NOT_DOWNLOADED && m.userAdded && (
