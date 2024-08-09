@@ -9,6 +9,7 @@ export interface Model {
   url: string;
   size: number; // in bytes
   userAdded?: boolean;
+  userAddedLocal?: boolean;
 }
 
 export enum ModelState {
